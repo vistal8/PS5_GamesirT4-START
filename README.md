@@ -1,5 +1,10 @@
 # Ghostcontrol — by StonedModder
 
+If you enjoy my work - please consider donating to my BTC address: 
+
+`bc1qa9zfgnccajsw8vg7k287qz5a7apf8pefj5jjx5`
+
+
 Use third-party USB controllers on PS5. Reads USB HID input from a plugged-in controller and injects it into a virtual DualSense via the PS5's `scePadVirtualDeviceInsertData` path (Ghostpad VDI path).
 
 **Tested controller:** 8BitDo Ultimate 2 in Nintendo Switch Pro Controller mode (VID=0x057e PID=0x2009)
