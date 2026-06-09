@@ -100,6 +100,7 @@ typedef struct {
     volatile int     vdi_ready;
     volatile int     usb_active;    /* USB reader thread is running */
     volatile int     confirmed;     /* user pressed a button — assignment done */
+    volatile int     usb_fd;        /* open ugen fd, -1 if none — for clean teardown */
     char             dev_path[32];  /* ugen path claimed by this slot */
     uint16_t         vid, pid;
     volatile uint32_t inject_count;
@@ -227,17 +228,32 @@ static void inject_pad(int slot, const ScePadData *pad) {
 #define VID_XBOX    0x045eu
 #define PID_XBOX    0x02eau
 
+/* Xbox One/Series GIP interface signature (USB interface descriptor).
+ * Confirmed on PS5 hardware: bInterfaceSubClass=0x47, bInterfaceProtocol=0xD0.
+ * This matches EVERY Xbox One/Series controller regardless of PID, unlike the
+ * single hardcoded PID_XBOX. See issue #2. */
+#define XBOX_GIP_SUBCLASS  0x47u
+#define XBOX_GIP_PROTOCOL  0xD0u
+
 /* Path list is now built dynamically per scan from /dev — see manager loop. */
 
 /* Match a (vid,pid) against our supported controller table.
  * Returns 1 if recognized — fills out_vid/out_pid even if PID is unknown
- * (so DS4-family clones with novel PIDs still hit the DS4 path). */
+ * (so DS4-family clones with novel PIDs still hit the DS4 path).
+ * NOTE: Xbox is NOT matched here — it is detected by GIP interface protocol
+ * in probe_one_path (covers all Xbox One/Series PIDs, rejects non-controller
+ * Microsoft USB devices). */
 static int match_known_vidpid(uint16_t vid, uint16_t pid,
                               uint16_t *out_vid, uint16_t *out_pid) {
     if (vid == VID_SWITCH || vid == VID_NATIVE ||
-        vid == VID_XBOX   ||
         vid == VID_SONY   || vid == VID_HORI) {
         *out_vid = vid; *out_pid = pid;
+        return 1;
+    }
+    /* Exact-PID fallback for the known Xbox model — only fires if the GIP
+     * interface-protocol check failed to read (it normally catches Xbox). */
+    if (vid == VID_XBOX && pid == PID_XBOX) {
+        *out_vid = VID_XBOX; *out_pid = PID_XBOX;
         return 1;
     }
     return 0;
@@ -275,6 +291,25 @@ static int probe_one_path(const char *path, uint16_t *out_vid, uint16_t *out_pid
             uint16_t pid = UGETW(desc.idProduct);
             desc_ok = 1;
             gp_log("scan: %s VID=0x%04x PID=0x%04x\n", path, vid, pid);
+
+            /* Xbox One/Series detection by GIP interface protocol (issue #2).
+             * Catches ALL Xbox One/Series pads regardless of PID. Runs first so
+             * a non-0x02ea Xbox normalizes to the canonical VID_XBOX/PID_XBOX
+             * the usb_hid_thread routing expects — no routing change needed. */
+            {
+                struct usb_interface_descriptor id;
+                memset(&id, 0, sizeof(id));
+                if (ioctl(fd, USB_GET_RX_INTERFACE_DESC, &id) == 0 &&
+                    id.bInterfaceSubClass == XBOX_GIP_SUBCLASS &&
+                    id.bInterfaceProtocol == XBOX_GIP_PROTOCOL) {
+                    gp_log("scan: %s GIP Xbox One/Series (sub=0x%02x proto=0x%02x)\n",
+                           path, id.bInterfaceSubClass, id.bInterfaceProtocol);
+                    *out_vid = VID_XBOX; *out_pid = PID_XBOX;
+                    close(fd);
+                    return 1;
+                }
+            }
+
             if (match_known_vidpid(vid, pid, out_vid, out_pid)) {
                 close(fd);
                 return 1;
@@ -570,6 +605,7 @@ main_loop: ;
     int is_ds4 = (vid == VID_SONY || vid == VID_HORI);
     int hs_state = (pid==PID_XBOX || is_ds4) ? HS_STREAMING : HS_WAIT_81_01;
     uint8_t nintendo_seq = 1;
+    g_slots[slot].usb_fd = fd;  /* register fd for clean teardown on SIGTERM */
 
     while (1) {
         memset(buf,0,64);
@@ -635,6 +671,7 @@ main_loop: ;
     }
 
 reinit:
+    g_slots[slot].usb_fd = -1;  /* unregister before teardown */
     if (usb_ready_notified) { notify("Ghostcontrol: slot[%d] controller disconnected", slot); usb_ready_notified=0; }
     memset(&stop,0,sizeof(stop)); stop.ep_index=0; ioctl(fd,USB_FS_STOP,&stop);
     if (out_opened) {
@@ -653,6 +690,7 @@ exit_slot:
     g_slots[slot].handle    = -1;
     g_slots[slot].vdi_ready = 0;
     g_slots[slot].usb_active= 0;
+    g_slots[slot].usb_fd    = -1;
     g_slots[slot].dev_path[0] = '\0';
     pthread_mutex_unlock(&g_slot_lock);
     return NULL;
@@ -803,7 +841,7 @@ static void *controller_manager_thread(void *arg) {
          * gate after ~30s so the queue does not stall forever. */
         static int assign_wait = 0;
         if (g_assign_slot >= 0) {
-            if (++assign_wait > 15) {  /* 15 * 2s = 30s */
+            if (++assign_wait > 6) {  /* 6 * 2s = 12s */
                 gp_log("manager: assignment timeout slot[%d] — releasing gate\n", g_assign_slot);
                 g_assign_slot = -1;
                 assign_wait = 0;
@@ -835,6 +873,33 @@ static void elevate_credentials(void) {
 }
 
 /* ── main ─────────────────────────────────────────────────────────────── */
+/* Clean USB teardown on termination. When a new payload instance kills this one
+ * (SIGTERM), release every claimed ugen device so the controller is left in a
+ * clean state — otherwise the killed payload leaves endpoints open / the driver
+ * detached, and the next instance can't re-handshake without a physical replug.
+ * close()/_exit() are async-signal-safe; the USB ioctls run at process death. */
+static void cleanup_and_exit(int sig) {
+    (void)sig;
+    for (int s = 0; s < MAX_SLOTS; s++) {
+        int fd = g_slots[s].usb_fd;
+        if (fd >= 0) {
+            struct usb_fs_stop  st; memset(&st,0,sizeof(st));
+            st.ep_index=0; ioctl(fd,USB_FS_STOP,&st);
+            st.ep_index=1; ioctl(fd,USB_FS_STOP,&st);
+            struct usb_fs_close fc; memset(&fc,0,sizeof(fc));
+            fc.ep_index=0; ioctl(fd,USB_FS_CLOSE,&fc);
+            fc.ep_index=1; ioctl(fd,USB_FS_CLOSE,&fc);
+            struct usb_fs_uninit un; memset(&un,0,sizeof(un));
+            ioctl(fd,USB_FS_UNINIT,&un);
+            close(fd);
+            g_slots[s].usb_fd = -1;
+        }
+        if (g_slots[s].handle >= 0)
+            scePadVirtualDeviceDeleteDevice(g_slots[s].handle);
+    }
+    _exit(0);
+}
+
 int main(void) {
     int32_t userId=-1, fgUser=-1; int ret;
 
@@ -846,7 +911,7 @@ int main(void) {
     { int pfd=open(PID_PATH,O_RDONLY);
       if(pfd>=0){char pb[16]={0};read(pfd,pb,15);close(pfd);
         pid_t old=(pid_t)atoi(pb);
-        if(old>0&&old!=getpid()){gp_log("Killing prev pid=%d\n",old);kill(old,SIGTERM);usleep(600000);}
+        if(old>0&&old!=getpid()){gp_log("Killing prev pid=%d\n",old);kill(old,SIGTERM);usleep(1200000);}
       }
       int pfd2=open(PID_PATH,O_WRONLY|O_CREAT|O_TRUNC,0600);
       if(pfd2>=0){char pb[16];snprintf(pb,sizeof(pb),"%d",getpid());write(pfd2,pb,strlen(pb));close(pfd2);}
@@ -858,9 +923,14 @@ int main(void) {
         g_slots[s].vdi_ready  = 0;
         g_slots[s].usb_active = 0;
         g_slots[s].confirmed  = 0;
+        g_slots[s].usb_fd     = -1;
         g_slots[s].dev_path[0]= '\0';
     }
     g_assign_slot = -1;
+
+    /* Clean teardown when the next deploy kills us — releases the controllers */
+    signal(SIGTERM, cleanup_and_exit);
+    signal(SIGINT,  cleanup_and_exit);
 
     sceUserServiceInitialize(NULL);
     sceUserServiceGetInitialUser(&userId);
