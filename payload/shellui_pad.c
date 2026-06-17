@@ -3240,6 +3240,130 @@ fallback:
 }
 
 int
+shellui_pad_disconnect_first_physical_candidate(uint64_t skipDeviceId, uint64_t *outDeviceId)
+{
+    if (outDeviceId)
+        *outDeviceId = 0;
+
+    pid_t pids[4];
+    if (find_pids("SceShellUI", pids, 4) == 0) {
+        klog_printf("[Ghostpad] sweep_disconnect: SceShellUI not found\n");
+        return -1;
+    }
+    pid_t target = pids[0];
+    klog_printf("[Ghostpad] sweep_disconnect: PT_ATTACH(SceShellUI pid=%d) skip=0x%llx\n",
+                target, (unsigned long long)skipDeviceId);
+    if (sys_ptrace(PT_ATTACH, target, 0, 0) != 0) {
+        klog_printf("[Ghostpad] sweep_disconnect: PT_ATTACH failed errno=%d\n", errno);
+        return -1;
+    }
+    waitpid(target, NULL, 0);
+
+    uint32_t mbus_h = 0;
+    get_lib(target, "libSceMbus", &mbus_h);
+    intptr_t fn_disc = mbus_h ? resolve_sym(target, mbus_h, "sceMbusDisconnectDevice") : 0;
+
+    uint32_t libpad_h = 0;
+    get_lib(target, "libScePad", &libpad_h);
+    intptr_t trap_mem = libpad_h ? kernel_dynlib_init_addr(target, libpad_h) : 0;
+    if (!trap_mem && libpad_h)
+        trap_mem = kernel_dynlib_fini_addr(target, libpad_h);
+
+    if (!fn_disc || !trap_mem) {
+        klog_printf("[Ghostpad] sweep_disconnect: symbol/cave fail fn=0x%lx trap=0x%lx\n",
+                    fn_disc, trap_mem);
+        sys_ptrace(PT_DETACH, target, (caddr_t)1, 0);
+        return -1;
+    }
+    kernel_set_vmem_protection(target, trap_mem, 16, PROT_READ | PROT_WRITE | PROT_EXEC);
+    uint8_t int3 = 0xCC;
+    pt_io_write(target, trap_mem, &int3, 1);
+
+    int calls = 0;
+    for (uint32_t prefix = 0; prefix <= 0xff; prefix++) {
+        uint64_t dev = ((uint64_t)prefix << 16) | 0x0300u;
+        if (!dev || dev == skipDeviceId)
+            continue;
+        calls++;
+        int64_t ret = pt_call(target, fn_disc, trap_mem, dev, 0, 0, 0, 0, 0);
+        if (ret == 0) {
+            if (outDeviceId)
+                *outDeviceId = dev;
+            klog_printf("[Ghostpad] sweep_disconnect: sceMbusDisconnectDevice(0x%llx) -> 0 after %d calls\n",
+                        (unsigned long long)dev, calls);
+            sys_ptrace(PT_DETACH, target, (caddr_t)1, 0);
+            return 0;
+        }
+    }
+
+    klog_printf("[Ghostpad] sweep_disconnect: no physical 0x..0300 device disconnected after %d calls\n",
+                calls);
+    sys_ptrace(PT_DETACH, target, (caddr_t)1, 0);
+    return -1;
+}
+
+int
+shellui_pad_user_has_handle(int32_t userId, int32_t observedHandle)
+{
+    if (observedHandle < 0)
+        return 0;
+
+    pid_t pids[4];
+    if (find_pids("SceShellUI", pids, 4) == 0) {
+        klog_printf("[Ghostpad] handle_user: SceShellUI not found\n");
+        return -1;
+    }
+    pid_t target = pids[0];
+    klog_printf("[Ghostpad] handle_user: PT_ATTACH(SceShellUI pid=%d) user=0x%x observed=0x%x\n",
+                target, (uint32_t)userId, (uint32_t)observedHandle);
+    if (sys_ptrace(PT_ATTACH, target, 0, 0) != 0) {
+        klog_printf("[Ghostpad] handle_user: PT_ATTACH failed errno=%d\n", errno);
+        return -1;
+    }
+    waitpid(target, NULL, 0);
+
+    uint32_t libpad_h = 0;
+    get_lib(target, "libScePad", &libpad_h);
+    intptr_t fn_gethandle = libpad_h ? resolve_sym(target, libpad_h, "scePadGetHandle") : 0;
+    intptr_t trap_mem = libpad_h ? kernel_dynlib_init_addr(target, libpad_h) : 0;
+    if (!trap_mem && libpad_h)
+        trap_mem = kernel_dynlib_fini_addr(target, libpad_h);
+
+    if (!fn_gethandle || !trap_mem) {
+        klog_printf("[Ghostpad] handle_user: symbol/cave fail GH=0x%lx trap=0x%lx\n",
+                    fn_gethandle, trap_mem);
+        sys_ptrace(PT_DETACH, target, (caddr_t)1, 0);
+        return -1;
+    }
+    kernel_set_vmem_protection(target, trap_mem, 16, PROT_READ | PROT_WRITE | PROT_EXEC);
+    uint8_t int3 = 0xCC;
+    pt_io_write(target, trap_mem, &int3, 1);
+
+    int match = 0;
+    const int types[] = {0, 3, 16};
+    for (int t = 0; t < (int)(sizeof(types) / sizeof(types[0])) && !match; t++) {
+        for (int idx = 0; idx < 8 && !match; idx++) {
+            int64_t gh = pt_call(target, fn_gethandle, trap_mem,
+                                 (uint64_t)(uint32_t)userId,
+                                 (uint64_t)types[t], (uint64_t)idx,
+                                 0, 0, 0);
+            if ((int32_t)gh >= 0) {
+                klog_printf("[Ghostpad] handle_user: GH(0x%x,t=%d,i=%d)->0x%llx\n",
+                            (uint32_t)userId, types[t], idx,
+                            (unsigned long long)(uint64_t)gh);
+                if ((uint32_t)gh == (uint32_t)observedHandle)
+                    match = 1;
+            }
+        }
+    }
+
+    klog_printf("[Ghostpad] handle_user: observed=0x%x user=0x%x match=%d\n",
+                (uint32_t)observedHandle, (uint32_t)userId, match);
+    sys_ptrace(PT_DETACH, target, (caddr_t)1, 0);
+    return match;
+}
+
+int
 shellui_pad_force_bind(uint64_t virtualDeviceId, int32_t userId)
 {
     pid_t pids[16];

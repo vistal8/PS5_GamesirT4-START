@@ -113,6 +113,12 @@ int shellui_pad_force_bind(uint64_t virtualDeviceId, int32_t userId);
  * becomes the sole device at slot 0.  Returns 0 on success. */
 int shellui_pad_disconnect_device(uint64_t physicalDeviceId);
 
+/* Fallback when klog did not expose the physical Open Pad id. */
+int shellui_pad_disconnect_first_physical_candidate(uint64_t skipDeviceId, uint64_t *outDeviceId);
+
+/* Check whether a klog Open Pad handle belongs to a specific user in SceShellUI. */
+int shellui_pad_user_has_handle(int32_t userId, int32_t observedHandle);
+
 /* PT_ATTACH SceShellUI and call scePadVirtualDeviceInsertData(pad_handle, cross_data)
  * directly, bypassing scePadGetHandle.  padHandle comes from the CIM log. */
 int shellui_pad_test_vdi_cross(int32_t pad_handle);

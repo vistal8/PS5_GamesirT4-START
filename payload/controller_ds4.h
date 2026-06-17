@@ -48,24 +48,6 @@
 #define PID_HORIPAD_FPSPLUS_X 0x00EEu
 #define PID_HORIPAD_MINI4     0x00C9u
 
-/* Third-party PS4-protocol vendor IDs (see DS4_EXTRA_PAIRS table in
- * controller_ds4.c). Devices from these vendors are PID-filtered against
- * the SDL list because most of them also ship Xbox-protocol controllers
- * under the same VID. */
-#define VID_VENOM             0x0079u
-#define VID_THRUSTMASTER      0x044Fu
-#define VID_MADCATZ           0x0738u
-#define VID_BROOK             0x0C12u  /* Brook / ZEROPLUS / Hitbox / EMIO clones */
-#define VID_PDP               0x0E6Fu  /* Performance Designed Products — Victrix */
-#define VID_PS4FUN            0x11C0u
-#define VID_NACON             0x146Bu
-#define VID_RAZER             0x1532u
-#define VID_POWERA            0x20D6u
-#define VID_QANBA             0x2C22u
-#define VID_NACON_NEW         0x3285u  /* NACON's secondary VID (Revolution 5 Pro) */
-#define VID_LEVELUP           0x7545u  /* Armor 3 / Level Up */
-#define VID_ASTRO             0x9886u
-
 #define DS4_EP_IN     0x84
 #define DS4_EP_IN_ALT 0x81
 #define DS4_EP_OUT    0x03
@@ -79,10 +61,3 @@ void ds4_parse_input(const uint8_t *buf, ScePadData *out_pad);
 int  ds4_handle_packet(int fd, struct usb_fs_endpoint *eps,
                        const uint8_t *buf, uint32_t len,
                        ScePadData *out_pad);
-
-/* Returns 1 if (vid, pid) is a known PS4-protocol USB device per SDL's
- * controller_list.h. VID_SONY and VID_HORI match unconditionally (Sony
- * only ships PS-compat controllers; HORI's Xbox-protocol pads are caught
- * earlier by the GIP interface descriptor path so the wildcard is safe).
- * All other vendors must match a specific PID in DS4_EXTRA_PAIRS. */
-int  ds4_is_compatible_vidpid(uint16_t vid, uint16_t pid);

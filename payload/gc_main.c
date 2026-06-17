@@ -1,10 +1,10 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * Ghost-Control v5: Multi-controller support
+ * Ghost-Control v5 by StonedModder: Multi-controller support
  * USB HID controllers → virtual DualSense devices on PS5
  *
- * Supports up to MAX_SLOTS (4) simultaneous controllers:
- *   - 8BitDo / Nintendo Switch Pro  (VID=057E PID=2009)
- *   - Xbox One S                    (VID=045E PID=02EA)
+ * Patch Manba V2 NBJr:
+ *   - PC/XInput mode                (VID=045E PID=028E)
+ *   - Switch USB mode               (VID=057E PID=2009)
  *
  * Each detected controller gets its own VDA device + force_bind
  * assignment dialog + VDI injection thread.
@@ -26,7 +26,6 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <dirent.h>
-#include <poll.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -46,8 +45,7 @@
 #include "controller_nintendo.h"
 #include "controller_xbox.h"
 #include "controller_ds4.h"
-#include "controller_ds3.h"
-#include "controller_logitech.h"
+#include "controller_mamba.h"
 
 /* ── Logging ──────────────────────────────────────────────────────────── */
 #define LOG_DIR  "/data/ghostpad"
@@ -102,16 +100,29 @@ typedef struct {
     volatile int32_t handle;        /* VDA handle, -1 = slot free */
     volatile int     vdi_ready;
     volatile int     usb_active;    /* USB reader thread is running */
+    volatile int     release_requested;
+    volatile int     released_pause;
+    volatile int     release_wait_neutral;
     volatile int     confirmed;     /* user pressed a button — assignment done */
     volatile int     usb_fd;        /* open ugen fd, -1 if none — for clean teardown */
     char             dev_path[32];  /* ugen path claimed by this slot */
     uint16_t         vid, pid;
+    volatile uint64_t virtual_dev_id;
+    volatile uint64_t evicted_physical_dev;
+    volatile int      physical_evict_done;
     volatile uint32_t inject_count;
 } ctrl_slot_t;
 
 static ctrl_slot_t     g_slots[MAX_SLOTS];
 static pthread_mutex_t g_slot_lock = PTHREAD_MUTEX_INITIALIZER;
 static int32_t         g_inject_uid = 0x10000000;
+static volatile uint64_t g_last_physical_pad_dev = 0;
+static volatile uint64_t g_pending_physical_recover_dev = 0;
+static volatile uint64_t g_recovered_physical_pad_dev = 0;
+static volatile int      g_physical_recover_attempts = 0;
+static volatile int      g_physical_recover_last_scan = -1000;
+static uint64_t          g_virtual_id_history[32];
+static unsigned          g_virtual_id_history_w = 0;
 
 /* Assignment serialization: only ONE controller may show its assignment
  * dialog at a time. g_assign_slot = slot awaiting user confirmation, or -1.
@@ -124,6 +135,29 @@ static uint64_t        g_klog_q[KLOG_QSIZE];
 static int             g_klog_qw = 0, g_klog_qr = 0;
 static pthread_mutex_t g_klog_lock = PTHREAD_MUTEX_INITIALIZER;
 
+typedef struct {
+    uint64_t dev_id;
+    int32_t  handle;
+    int32_t  open_type;
+} klog_open_pad_t;
+
+#define KLOG_OPEN_PAD_COUNT 16
+static klog_open_pad_t g_klog_open_pad[KLOG_OPEN_PAD_COUNT];
+static unsigned        g_klog_open_pad_w = 0;
+
+static void klog_open_pad_store(uint64_t dev_id, int32_t open_type, int32_t handle);
+static int32_t klog_find_open_pad_handle(uint64_t dev_id);
+static int32_t klog_wait_open_pad_handle(uint64_t dev_id, int ms);
+static uint64_t klog_find_physical_open_pad(uint64_t virtual_dev_id);
+static int is_our_virtual_device_id(uint64_t dev_id);
+static void remember_virtual_device_id(uint64_t dev_id);
+static int any_mamba_slot_active(void);
+static void remember_physical_pad_for_recovery(uint64_t dev_id, const char *reason);
+static void physical_recovery_tick(int scan);
+
+static void maybe_stop_mamba_for_same_user_physical_open(uint64_t dev_id,
+                                                         int32_t open_handle,
+                                                         const char *line);
 static void klog_enqueue(uint64_t id) {
     pthread_mutex_lock(&g_klog_lock);
     int next = (g_klog_qw + 1) % KLOG_QSIZE;
@@ -168,18 +202,136 @@ static uint64_t parse_hex_str(const char *s) {
     return v;
 }
 
+static uint64_t parse_uint_auto(const char *s, const char **endp, int *ok) {
+    uint64_t v = 0;
+    int base = 10;
+    int got = 0;
+
+    while (*s == ' ' || *s == '\t')
+        s++;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        base = 16;
+        s += 2;
+    }
+
+    while (*s) {
+        char c = *s;
+        int d;
+        if (c >= '0' && c <= '9') d = c - '0';
+        else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+        else break;
+        if (d >= base) break;
+        v = (v * (uint64_t)base) + (uint64_t)d;
+        got = 1;
+        s++;
+    }
+
+    if (endp) *endp = s;
+    if (ok) *ok = got;
+    return v;
+}
+
+static int parse_open_pad_line(const char *line, uint64_t *out_dev_id,
+                               int32_t *out_open_type, int32_t *out_open_index,
+                               int32_t *out_handle) {
+    const char *open = strstr(line, "Open Pad [");
+    if (!open)
+        return 0;
+
+    const char *p = open + 10;
+    int ok_dev = 0;
+    uint64_t dev_id = parse_uint_auto(p, &p, &ok_dev);
+    if (!ok_dev)
+        return 0;
+
+    const char *comma = strchr(p, ',');
+    if (!comma)
+        return 0;
+    comma++;
+
+    int ok_type = 0;
+    uint64_t open_type = parse_uint_auto(comma, &p, &ok_type);
+    if (!ok_type || open_type > 0x7fffffffU)
+        return 0;
+
+    comma = strchr(p, ',');
+    if (!comma)
+        return 0;
+    comma++;
+
+    int ok_index = 0;
+    uint64_t open_index = parse_uint_auto(comma, &p, &ok_index);
+    if (!ok_index || open_index > 0x7fffffffU)
+        return 0;
+
+    const char *ret = strstr(p, "ret=");
+    if (!ret)
+        return 0;
+    ret += 4;
+
+    int ok_ret = 0;
+    uint64_t h = parse_uint_auto(ret, NULL, &ok_ret);
+    if (!ok_ret || h > 0x7fffffffu)
+        return 0;
+
+    *out_dev_id = dev_id;
+    *out_open_type = (int32_t)open_type;
+    *out_open_index = (int32_t)open_index;
+    *out_handle = (int32_t)h;
+    return 1;
+}
+
 static void parse_klog_line(const char *line) {
+    if (strstr(line, "[payload.elf] [GC]") ||
+        strstr(line, "[payload.elf] [Ghostpad]")) {
+        return;
+    }
+
+    if (strstr(line, "USERASSIGNED") || strstr(line, "DEVICE_DELETED")) {
+        gp_log("klog pad event: %.420s\n", line);
+    }
+
+    uint64_t open_dev_id = 0;
+    int32_t open_type = -1;
+    int32_t open_index = -1;
+    int32_t open_handle = -1;
+    if (!strstr(line, "[GC] klog: Open Pad") &&
+        parse_open_pad_line(line, &open_dev_id, &open_type, &open_index, &open_handle)) {
+        gp_log("klog: Open Pad dev=0x%llx type=%d index=%d handle=0x%x line=%.320s\n",
+               (unsigned long long)open_dev_id, open_type, open_index,
+               (uint32_t)open_handle, line);
+        klog_open_pad_store(open_dev_id, open_type, open_handle);
+        if (open_type == 0 && !is_our_virtual_device_id(open_dev_id)) {
+            if (!any_mamba_slot_active()) {
+                remember_physical_pad_for_recovery(open_dev_id,
+                                                   "physical Open Pad while Manba is off");
+            } else {
+                maybe_stop_mamba_for_same_user_physical_open(open_dev_id, open_handle, line);
+            }
+        }
+    }
+
+    if (strstr(line, "[GC] klog:"))           return;
     if (!strstr(line, "DEVICE_ADDED"))        return;
     if (!strstr(line, "subType:22"))          return;
-    if (!strstr(line, "capabilityBattery:0")) return;
     const char *p = strstr(line, "DeviceId:0x");
     if (!p) p = strstr(line, "deviceId=0x");
     if (!p) return;
     p += 11;
     uint64_t id = parse_hex_str(p);
     if (!id) return;
-    gp_log("klog: VDA device 0x%llx\n", (unsigned long long)id);
-    klog_enqueue(id);
+    if (strstr(line, "capabilityBattery:0")) {
+        gp_log("klog: VDA device 0x%llx\n", (unsigned long long)id);
+        remember_virtual_device_id(id);
+        klog_enqueue(id);
+    } else {
+        gp_log("klog: non-VDA pad device 0x%llx line=%.360s\n",
+               (unsigned long long)id, line);
+        if (!any_mamba_slot_active())
+            remember_physical_pad_for_recovery(id,
+                                               "fresh physical DEVICE_ADDED while Manba is off");
+    }
 }
 
 static void *klog_capture_thread(void *arg) {
@@ -248,32 +400,379 @@ static void inject_pad(int slot, const ScePadData *pad) {
  * Microsoft USB devices). */
 static int match_known_vidpid(uint16_t vid, uint16_t pid,
                               uint16_t *out_vid, uint16_t *out_pid) {
-    if (vid == VID_SWITCH || vid == VID_NATIVE || vid == VID_LOGITECH) {
+    if (mamba_is_supported_vidpid(vid, pid)) {
         *out_vid = vid; *out_pid = pid;
-        return 1;
-    }
-    /* DS3 / PS3-protocol third-parties — Sony DS3, HORI PS3 pads, Mad Catz
-     * Alpha PS3, Qanba PS3 sticks, PDP/Afterglow PS3, Logitech Chillstream,
-     * etc. See DS3_EXTRA_PAIRS in controller_ds3.c. Checked BEFORE the DS4
-     * branch because Sony and HORI VIDs hit both lists. */
-    if (ds3_is_compatible_vidpid(vid, pid)) {
-        *out_vid = vid; *out_pid = pid;
-        return 1;
-    }
-    /* DS4 / DS4-protocol third-parties — Sony, HORI, plus the full PS4
-     * VID/PID table (Mad Catz, Razer, Nacon, Brook, Qanba, Victrix, etc).
-     * See DS4_EXTRA_PAIRS in controller_ds4.c. */
-    if (ds4_is_compatible_vidpid(vid, pid)) {
-        *out_vid = vid; *out_pid = pid;
-        return 1;
-    }
-    /* Exact-PID fallback for the known Xbox model — only fires if the GIP
-     * interface-protocol check failed to read (it normally catches Xbox). */
-    if (vid == VID_XBOX && pid == PID_XBOX) {
-        *out_vid = VID_XBOX; *out_pid = PID_XBOX;
         return 1;
     }
     return 0;
+}
+
+static int is_our_virtual_device_id(uint64_t dev_id) {
+    if (!dev_id)
+        return 0;
+    for (int s = 0; s < MAX_SLOTS; s++) {
+        if (g_slots[s].virtual_dev_id == dev_id)
+            return 1;
+    }
+    for (int i = 0; i < (int)(sizeof(g_virtual_id_history) / sizeof(g_virtual_id_history[0])); i++) {
+        if (g_virtual_id_history[i] == dev_id)
+            return 1;
+    }
+    return 0;
+}
+
+static void remember_virtual_device_id(uint64_t dev_id) {
+    if (!dev_id)
+        return;
+
+    pthread_mutex_lock(&g_slot_lock);
+    for (int i = 0; i < (int)(sizeof(g_virtual_id_history) / sizeof(g_virtual_id_history[0])); i++) {
+        if (g_virtual_id_history[i] == dev_id) {
+            pthread_mutex_unlock(&g_slot_lock);
+            return;
+        }
+    }
+    g_virtual_id_history[g_virtual_id_history_w %
+                         (sizeof(g_virtual_id_history) / sizeof(g_virtual_id_history[0]))] = dev_id;
+    g_virtual_id_history_w++;
+    pthread_mutex_unlock(&g_slot_lock);
+}
+
+static void klog_open_pad_store(uint64_t dev_id, int32_t open_type, int32_t handle) {
+    if (!dev_id || handle < 0)
+        return;
+    pthread_mutex_lock(&g_klog_lock);
+    g_klog_open_pad[g_klog_open_pad_w % KLOG_OPEN_PAD_COUNT].dev_id = dev_id;
+    g_klog_open_pad[g_klog_open_pad_w % KLOG_OPEN_PAD_COUNT].handle = handle;
+    g_klog_open_pad[g_klog_open_pad_w % KLOG_OPEN_PAD_COUNT].open_type = open_type;
+    g_klog_open_pad_w++;
+    pthread_mutex_unlock(&g_klog_lock);
+}
+
+static int32_t klog_find_open_pad_handle(uint64_t dev_id) {
+    int32_t handle = -1;
+    pthread_mutex_lock(&g_klog_lock);
+    for (int i = 0; i < KLOG_OPEN_PAD_COUNT; i++) {
+        if (g_klog_open_pad[i].dev_id == dev_id) {
+            handle = g_klog_open_pad[i].handle;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_klog_lock);
+    return handle;
+}
+
+static uint64_t klog_find_physical_open_pad(uint64_t virtual_dev_id) {
+    uint64_t dev_id = 0;
+    pthread_mutex_lock(&g_klog_lock);
+    int count = g_klog_open_pad_w < KLOG_OPEN_PAD_COUNT ?
+                (int)g_klog_open_pad_w : KLOG_OPEN_PAD_COUNT;
+    for (int n = 0; n < count; n++) {
+        int idx = ((int)g_klog_open_pad_w - 1 - n) % KLOG_OPEN_PAD_COUNT;
+        if (idx < 0) idx += KLOG_OPEN_PAD_COUNT;
+        klog_open_pad_t rec = g_klog_open_pad[idx];
+        if (!rec.dev_id || rec.dev_id == virtual_dev_id)
+            continue;
+        if (rec.open_type != 0)
+            continue;
+        if (is_our_virtual_device_id(rec.dev_id))
+            continue;
+        dev_id = rec.dev_id;
+        break;
+    }
+    pthread_mutex_unlock(&g_klog_lock);
+    return dev_id;
+}
+
+static int32_t klog_wait_open_pad_handle(uint64_t dev_id, int ms) {
+    for (int t = 0; t <= ms; t += 100) {
+        int32_t handle = klog_find_open_pad_handle(dev_id);
+        if (handle >= 0)
+            return handle;
+        usleep(100000);
+    }
+    return -1;
+}
+
+static void remember_physical_pad_for_recovery(uint64_t dev_id, const char *reason) {
+    if (!dev_id || is_our_virtual_device_id(dev_id))
+        return;
+
+    int should_log = 0;
+    pthread_mutex_lock(&g_slot_lock);
+    g_last_physical_pad_dev = dev_id;
+    if (g_recovered_physical_pad_dev != dev_id &&
+        g_pending_physical_recover_dev != dev_id) {
+        g_pending_physical_recover_dev = dev_id;
+        g_physical_recover_attempts = 0;
+        g_physical_recover_last_scan = -1000;
+        should_log = 1;
+    }
+    pthread_mutex_unlock(&g_slot_lock);
+
+    if (should_log) {
+        gp_log("physical recover scheduled dev=0x%llx reason=%s\n",
+               (unsigned long long)dev_id, reason ? reason : "-");
+    }
+}
+
+static void physical_recovery_tick(int scan) {
+    if (any_mamba_slot_active())
+        return;
+
+    uint64_t dev = 0;
+    int attempt = 0;
+    pthread_mutex_lock(&g_slot_lock);
+    dev = g_pending_physical_recover_dev;
+    if (!dev || (scan - g_physical_recover_last_scan) < 3) {
+        pthread_mutex_unlock(&g_slot_lock);
+        return;
+    }
+    g_physical_recover_last_scan = scan;
+    attempt = ++g_physical_recover_attempts;
+    pthread_mutex_unlock(&g_slot_lock);
+
+    gp_log("physical recover attempt #%d dev=0x%llx user=0x%08x\n",
+           attempt, (unsigned long long)dev, (uint32_t)g_inject_uid);
+    int br = shellui_pad_force_bind(dev, g_inject_uid);
+    gp_log("physical recover force_bind dev=0x%llx ret=%d\n",
+           (unsigned long long)dev, br);
+
+    if (br == 0) {
+        pthread_mutex_lock(&g_slot_lock);
+        if (g_pending_physical_recover_dev == dev)
+            g_pending_physical_recover_dev = 0;
+        g_recovered_physical_pad_dev = dev;
+        pthread_mutex_unlock(&g_slot_lock);
+        notify("Ghost-Control by StonedModder: official controller restored");
+    }
+}
+
+static int any_mamba_slot_active(void) {
+    int active = 0;
+    pthread_mutex_lock(&g_slot_lock);
+    for (int s = 0; s < MAX_SLOTS; s++) {
+        if (g_slots[s].usb_active &&
+            g_slots[s].vdi_ready &&
+            !g_slots[s].released_pause &&
+            mamba_is_supported_vidpid(g_slots[s].vid, g_slots[s].pid)) {
+            active = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_slot_lock);
+    return active;
+}
+
+static void maybe_disconnect_physical_pad_for_slot(int slot) {
+    static uint64_t attempted[4];
+    static uint64_t last_vdev[4];
+    static int fallback_attempted[4];
+    uint64_t vdev = g_slots[slot].virtual_dev_id;
+    if (!vdev)
+        return;
+    if (last_vdev[slot] != vdev) {
+        last_vdev[slot] = vdev;
+        attempted[slot] = 0;
+        fallback_attempted[slot] = 0;
+    }
+    if (g_slots[slot].physical_evict_done)
+        return;
+
+    uint64_t phys = klog_find_physical_open_pad(vdev);
+    if (!phys) {
+        if (!fallback_attempted[slot]) {
+            uint64_t swept = 0;
+            fallback_attempted[slot] = 1;
+            gp_log("slot[%d] no physical Open Pad before Manba dev=0x%llx; sweeping MBus physical ids\n",
+                   slot, (unsigned long long)vdev);
+            int sr = shellui_pad_disconnect_first_physical_candidate(vdev, &swept);
+            gp_log("slot[%d] physical sweep ret=%d dev=0x%llx\n",
+                   slot, sr, (unsigned long long)swept);
+            if (sr == 0 && swept) {
+                attempted[slot] = swept;
+                g_slots[slot].evicted_physical_dev = swept;
+                pthread_mutex_lock(&g_slot_lock);
+                g_recovered_physical_pad_dev = 0;
+                pthread_mutex_unlock(&g_slot_lock);
+                remember_physical_pad_for_recovery(swept,
+                                                   "physical pad swept for Manba");
+                g_slots[slot].physical_evict_done = 1;
+            }
+        }
+        return;
+    }
+    if (phys == attempted[slot])
+        return;
+
+    attempted[slot] = phys;
+    g_slots[slot].evicted_physical_dev = phys;
+    pthread_mutex_lock(&g_slot_lock);
+    g_recovered_physical_pad_dev = 0;
+    pthread_mutex_unlock(&g_slot_lock);
+    remember_physical_pad_for_recovery(phys, "physical pad evicted for Manba");
+
+    gp_log("slot[%d] game opened physical pad dev=0x%llx before Manba dev=0x%llx; disconnecting physical\n",
+           slot, (unsigned long long)phys, (unsigned long long)vdev);
+    int dr = shellui_pad_disconnect_device(phys);
+    gp_log("slot[%d] disconnect physical dev=0x%llx ret=%d\n",
+           slot, (unsigned long long)phys, dr);
+    if (dr == 0)
+        g_slots[slot].physical_evict_done = 1;
+}
+
+static int active_evicted_mamba_slot_snapshot(int *out_slot, uint64_t *out_vdev,
+                                              uint64_t *out_evicted_phys) {
+    int found = 0;
+    pthread_mutex_lock(&g_slot_lock);
+    for (int s = 0; s < MAX_SLOTS; s++) {
+        if (g_slots[s].usb_active &&
+            mamba_is_supported_vidpid(g_slots[s].vid, g_slots[s].pid) &&
+            g_slots[s].virtual_dev_id &&
+            g_slots[s].physical_evict_done) {
+            if (out_slot) *out_slot = s;
+            if (out_vdev) *out_vdev = g_slots[s].virtual_dev_id;
+            if (out_evicted_phys) *out_evicted_phys = g_slots[s].evicted_physical_dev;
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_slot_lock);
+    return found;
+}
+
+static int is_official_like_physical_device(uint64_t dev_id) {
+    if (!dev_id || is_our_virtual_device_id(dev_id))
+        return 0;
+    return ((dev_id & 0xffffu) == 0x0300u);
+}
+
+static int local_pad_user_has_handle(int32_t userId, int32_t observedHandle) {
+    if (observedHandle < 0)
+        return 0;
+
+    const int types[] = {0, 3, 16};
+    for (int t = 0; t < (int)(sizeof(types) / sizeof(types[0])); t++) {
+        for (int idx = 0; idx < 8; idx++) {
+            int32_t h = scePadGetHandle(userId, types[t], idx);
+            if (h >= 0) {
+                gp_log("reclaim_local: GH user=0x%08x type=%d idx=%d handle=0x%x observed=0x%x\n",
+                       (uint32_t)userId, types[t], idx, (uint32_t)h,
+                       (uint32_t)observedHandle);
+                if ((uint32_t)h == (uint32_t)observedHandle)
+                    return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+static void release_mamba_vda_only(int slot, const char *reason) {
+    if (slot < 0 || slot >= MAX_SLOTS)
+        return;
+
+    int32_t handle = -1;
+    uint64_t vdev = 0;
+
+    pthread_mutex_lock(&g_slot_lock);
+    handle = g_slots[slot].handle;
+    vdev = g_slots[slot].virtual_dev_id;
+    g_slots[slot].release_requested = 0;
+    g_slots[slot].released_pause = 1;
+    g_slots[slot].release_wait_neutral = 1;
+    g_slots[slot].confirmed = 0;
+    g_slots[slot].vdi_ready = 0;
+    g_slots[slot].handle = -1;
+    g_slots[slot].virtual_dev_id = 0;
+    g_slots[slot].evicted_physical_dev = 0;
+    g_slots[slot].physical_evict_done = 0;
+    g_slots[slot].inject_count = 0;
+    if (g_assign_slot == slot)
+        g_assign_slot = -1;
+    pthread_mutex_unlock(&g_slot_lock);
+
+    gp_log("slot[%d] release pause: disconnect VDA handle=0x%x vdev=0x%llx reason=%s\n",
+           slot, (uint32_t)handle, (unsigned long long)vdev,
+           reason ? reason : "-");
+    if (vdev) {
+        int vdr = shellui_pad_disconnect_device(vdev);
+        gp_log("slot[%d] release pause disconnect virtual dev=0x%llx ret=%d\n",
+               slot, (unsigned long long)vdev, vdr);
+    }
+    if (handle >= 0)
+        scePadVirtualDeviceDeleteDevice(handle);
+}
+
+static void request_release_mamba_slot(int slot, const char *reason) {
+    if (slot < 0 || slot >= MAX_SLOTS)
+        return;
+
+    int active = 0;
+    int fd = -1;
+    int32_t handle = -1;
+    uint64_t vdev = 0;
+
+    pthread_mutex_lock(&g_slot_lock);
+    if (g_slots[slot].usb_active) {
+        g_slots[slot].release_requested = 1;
+        active = 1;
+        fd = g_slots[slot].usb_fd;
+        handle = g_slots[slot].handle;
+        vdev = g_slots[slot].virtual_dev_id;
+        if (g_assign_slot == slot)
+            g_assign_slot = -1;
+    }
+    pthread_mutex_unlock(&g_slot_lock);
+
+    gp_log("slot[%d] release request active=%d fd=%d handle=0x%x vdev=0x%llx reason=%s\n",
+           slot, active, fd, (uint32_t)handle, (unsigned long long)vdev,
+           reason ? reason : "-");
+}
+
+static void maybe_stop_mamba_for_same_user_physical_open(uint64_t dev_id,
+                                                         int32_t open_handle,
+                                                         const char *line) {
+    int slot = -1;
+    uint64_t vdev = 0;
+    uint64_t evicted_phys = 0;
+
+    if (!is_official_like_physical_device(dev_id))
+        return;
+    if (!active_evicted_mamba_slot_snapshot(&slot, &vdev, &evicted_phys))
+        return;
+
+    int local_match = local_pad_user_has_handle(g_inject_uid, open_handle);
+    int match = local_match ? 3 : shellui_pad_user_has_handle(g_inject_uid, open_handle);
+    gp_log("reclaim_check: physical dev=0x%llx handle=0x%x user=0x%08x match=%d local=%d slot[%d] vdev=0x%llx evicted=0x%llx line=%.220s\n",
+           (unsigned long long)dev_id, (uint32_t)open_handle,
+           (uint32_t)g_inject_uid, match, local_match, slot,
+           (unsigned long long)vdev, (unsigned long long)evicted_phys,
+           line ? line : "-");
+
+    if (match != 1 && match != 3) {
+        for (int pass = 0; pass < 10; pass++) {
+            int32_t fg = -1;
+            int32_t ret = sceUserServiceGetForegroundUser(&fg);
+            gp_log("reclaim_focus: pass=%d ret=0x%08x fg=0x%08x inject=0x%08x physical=0x%llx\n",
+                   pass, (uint32_t)ret, (uint32_t)fg,
+                   (uint32_t)g_inject_uid, (unsigned long long)dev_id);
+            if (ret == 0 && fg == g_inject_uid) {
+                match = 2;
+                break;
+            }
+            usleep(150000);
+        }
+    }
+
+    if (match != 1 && match != 2 && match != 3)
+        return;
+
+    gp_log("reclaim: physical pad dev=0x%llx opened on Manba user=0x%08x match=%d; releasing Manba slot[%d] vdev=0x%llx\n",
+           (unsigned long long)dev_id, (uint32_t)g_inject_uid, match,
+           slot, (unsigned long long)vdev);
+    notify("Ghost-Control: official controller took same user - releasing Manba");
+    request_release_mamba_slot(slot, "official same user reclaim");
 }
 
 /* Probe a /dev/ugen* path to identify controller type.
@@ -308,20 +807,33 @@ static int probe_one_path(const char *path, uint16_t *out_vid, uint16_t *out_pid
             uint16_t pid = UGETW(desc.idProduct);
             desc_ok = 1;
             gp_log("scan: %s VID=0x%04x PID=0x%04x\n", path, vid, pid);
-
+            if (vid == MAMBA_DONGLE_VID && pid == MAMBA_DONGLE_PID) {
+                gp_log("scan: %s Manba receiver idle/update mode ignored\n", path);
+                close(fd);
+                return 0;
+            }
             /* Xbox One/Series detection by GIP interface protocol (issue #2).
              * Catches ALL Xbox One/Series pads regardless of PID. Runs first so
              * a non-0x02ea Xbox normalizes to the canonical VID_XBOX/PID_XBOX
-             * the usb_hid_thread routing expects — no routing change needed. */
+             * the usb_hid_thread routing expects. In this Manba patch build,
+             * Xbox GIP devices are still ignored after identification. */
             {
                 struct usb_interface_descriptor id;
                 memset(&id, 0, sizeof(id));
                 if (ioctl(fd, USB_GET_RX_INTERFACE_DESC, &id) == 0 &&
                     id.bInterfaceSubClass == XBOX_GIP_SUBCLASS &&
                     id.bInterfaceProtocol == XBOX_GIP_PROTOCOL) {
-                    gp_log("scan: %s GIP Xbox One/Series (sub=0x%02x proto=0x%02x)\n",
+                    gp_log("scan: %s ignoring Xbox GIP in Manba patch build (sub=0x%02x proto=0x%02x)\n",
                            path, id.bInterfaceSubClass, id.bInterfaceProtocol);
-                    *out_vid = VID_XBOX; *out_pid = PID_XBOX;
+                    close(fd);
+                    return 0;
+                }
+                if (ioctl(fd, USB_GET_RX_INTERFACE_DESC, &id) == 0 &&
+                    mamba_is_xinput_interface(id.bInterfaceSubClass,
+                                              id.bInterfaceProtocol)) {
+                    gp_log("scan: %s Manba/XInput interface (sub=0x%02x proto=0x%02x)\n",
+                           path, id.bInterfaceSubClass, id.bInterfaceProtocol);
+                    *out_vid = MAMBA_XINPUT_VID; *out_pid = MAMBA_XINPUT_PID;
                     close(fd);
                     return 1;
                 }
@@ -358,25 +870,31 @@ static int probe_one_path(const char *path, uint16_t *out_vid, uint16_t *out_pid
 
     int found = 0;
 
-    /* Nintendo: ep=0x81, maxpkt=64 */
+    /* ep=0x81: Nintendo/Switch uses 64-byte HID; Manba PC/XInput is smaller. */
     po.ep_no=0x81;
-    if (ioctl(fd,USB_FS_OPEN,&po)==0 && po.max_packet_length==64) {
-        gp_log("probe: %s ep=0x81 mpkt=%u → Nintendo\n", path,(unsigned)po.max_packet_length);
+    if (ioctl(fd,USB_FS_OPEN,&po)==0) {
+        uint32_t mpkt = po.max_packet_length;
         struct usb_fs_close pc; memset(&pc,0,sizeof(pc)); pc.ep_index=0; ioctl(fd,USB_FS_CLOSE,&pc);
-        *out_vid=VID_SWITCH; *out_pid=PID_SWITCH;
-        found = 1;
-        goto done;
+        if (mpkt == 64) {
+            gp_log("probe: %s ep=0x81 mpkt=%u → Manba/Switch-HID\n", path,(unsigned)mpkt);
+            *out_vid=MAMBA_SWITCH_VID; *out_pid=MAMBA_SWITCH_PID;
+            found = 1;
+            goto done;
+        }
+        if (mpkt > 0 && mpkt < 64) {
+            gp_log("probe: %s ep=0x81 mpkt=%u → Manba/XInput\n", path,(unsigned)mpkt);
+            *out_vid=MAMBA_XINPUT_VID; *out_pid=MAMBA_XINPUT_PID;
+            found = 1;
+            goto done;
+        }
     }
 
-    /* Xbox One: ep=0x82, maxpkt in (0,64] */
+    /* Manba patch build: do not claim Xbox/DS4/Sony/HORI fallback devices. */
     memset(&po,0,sizeof(po)); po.ep_index=0; po.max_bufsize=64; po.max_frames=1;
     po.ep_no=0x82;
     if (ioctl(fd,USB_FS_OPEN,&po)==0 && po.max_packet_length>0 && po.max_packet_length<=64) {
-        gp_log("probe: %s ep=0x82 mpkt=%u → Xbox One\n", path,(unsigned)po.max_packet_length);
+        gp_log("probe: %s ep=0x82 mpkt=%u ignored in Manba patch build\n", path,(unsigned)po.max_packet_length);
         struct usb_fs_close pc; memset(&pc,0,sizeof(pc)); pc.ep_index=0; ioctl(fd,USB_FS_CLOSE,&pc);
-        *out_vid=VID_XBOX; *out_pid=PID_XBOX;
-        found = 1;
-        goto done;
     }
 
 done:
@@ -389,9 +907,15 @@ done:
 static int32_t create_vda_for_slot(int slot) {
     struct { int32_t size; int32_t userId; int32_t pad[6]; } vdp;
     const int32_t SEN = (int32_t)0xDEADBEEFu;
+    int is_mamba = mamba_is_supported_vidpid(g_slots[slot].vid, g_slots[slot].pid);
+
     memset(&vdp,0,sizeof(vdp)); vdp.size=sizeof(vdp); vdp.userId=1;
     for(int k=0;k<6;k++) vdp.pad[k]=SEN;
 
+    if (is_mamba) {
+        gp_log("slot[%d] Manba V2 NBJr VDA create for %s\n",
+               slot, mamba_name(g_slots[slot].vid, g_slots[slot].pid));
+    }
     int ret = scePadVirtualDeviceAddDevice(&vdp, VIRTUAL_DEVICE_TYPE_DUALSENSE);
     gp_log("slot[%d] VDA ret=0x%08x\n", slot, (uint32_t)ret);
 
@@ -402,10 +926,24 @@ static int32_t create_vda_for_slot(int slot) {
 
     uint64_t dev_id = klog_dequeue_ms(10000);
     if (dev_id) {
-        handle = (int32_t)(dev_id & 0xffffffffu);
+        g_slots[slot].virtual_dev_id = dev_id;
+        remember_virtual_device_id(dev_id);
         int br = shellui_pad_force_bind(dev_id, g_inject_uid);
         gp_log("slot[%d] force_bind(0x%llx, 0x%08x) ret=%d\n",
                slot, (unsigned long long)dev_id, (uint32_t)g_inject_uid, br);
+
+        int32_t open_handle = klog_wait_open_pad_handle(dev_id, 4000);
+        if (open_handle >= 0) {
+            gp_log("slot[%d] klog Open Pad remote handle=0x%x for dev=0x%llx\n",
+                   slot, (uint32_t)open_handle, (unsigned long long)dev_id);
+        } else {
+            gp_log("slot[%d] no Open Pad remote handle for dev=0x%llx\n",
+                   slot, (unsigned long long)dev_id);
+        }
+        handle = (int32_t)(dev_id & 0xffffffffu);
+        gp_log("slot[%d] using local VDA handle=0x%x for VDI\n",
+               slot, (uint32_t)handle);
+        maybe_disconnect_physical_pad_for_slot(slot);
     } else if (handle >= 0) {
         gp_log("slot[%d] klog timeout — using direct handle %d\n", slot, handle);
     } else {
@@ -451,70 +989,15 @@ static void *usb_hid_thread(void *arg) {
     struct usb_fs_close    fs_close;
     struct usb_fs_uninit   uninit;
     uint8_t  buf[64];
-    /* Multi-frame buffers — used by Logitech to queue N reads at once,
-     * keeping the kernel in "actively polling" mode so single sparse
-     * reports get buffered into available slots. */
-    void    *buffers[8]; uint32_t lengths[8];
-    int      n_frames = 1;
+    void    *buffers[1]; uint32_t lengths[1];
     int fd = -1, out_opened = 0;
     int usb_ready_notified = 0;
-    uint32_t in_mpkt = 64;  /* actual IN endpoint maxpkt — captured after open;
-                              defaulted to 64 for branches that don't set it */
 
     gp_log("slot[%d] USB thread: %s VID=0x%04x PID=0x%04x\n",
            slot, dev_path, vid, pid);
 
-    /* ── DS3 / SIXAXIS + PS3-protocol third-parties ───────────────────
-     * Needs GET_REPORT(0xF2)+GET_REPORT(0xF5) on EP0 -- without these
-     * two control transfers the controller never streams input reports.
-     * Sony and HORI VIDs match DS4 too, so this branch MUST run before
-     * the DS4 open block below. */
-    if (ds3_is_compatible_vidpid(vid, pid)) {
-        fd = open(dev_path, O_RDWR);
-        if (fd < 0) { gp_log("slot[%d] DS3 open fail errno=%d\n", slot, errno); goto exit_slot; }
-
-        { int ii; for(ii=0;ii<4;ii++){int i2=ii; ioctl(fd,USB_IFACE_DRIVER_DETACH,&i2);} }
-        usleep(100000);
-
-        memset(eps,0,sizeof(eps)); memset(&init,0,sizeof(init));
-        init.pEndpoints=eps; init.ep_index_max=1;
-        if (ioctl(fd,USB_FS_INIT,&init)!=0){
-            gp_log("slot[%d] DS3 FS_INIT fail errno=%d\n",slot,errno);
-            close(fd); goto exit_slot;
-        }
-
-        /* Operational handshake on EP0 -- both GET_REPORTs must succeed
-         * before opening the interrupt IN, otherwise the device sits idle. */
-        if (ds3_set_operational_usb(fd) != 0) {
-            gp_log("slot[%d] DS3 set_operational failed\n", slot);
-            goto uninit_exit;
-        }
-
-        memset(&fs_open,0,sizeof(fs_open));
-        fs_open.ep_index=0; fs_open.ep_no=DS3_EP_IN;
-        fs_open.max_bufsize=64; fs_open.max_frames=1;
-        if (ioctl(fd,USB_FS_OPEN,&fs_open)!=0){
-            gp_log("slot[%d] DS3 IN fail errno=%d\n",slot,errno);
-            goto uninit_exit;
-        }
-        gp_log("slot[%d] DS3 IN ep=0x%02x maxpkt=%u\n",
-               slot, DS3_EP_IN, (unsigned)fs_open.max_packet_length);
-        in_mpkt = fs_open.max_packet_length ? fs_open.max_packet_length : 64;
-
-        n_frames = 1;
-        buffers[0]=buf; lengths[0]=in_mpkt;
-        eps[0].ppBuffer=buffers; eps[0].pLength=lengths; eps[0].nFrames=1;
-        eps[0].timeout=50; eps[0].flags=USB_FS_FLAG_SINGLE_SHORT_OK|USB_FS_FLAG_MULTI_SHORT_OK;
-
-        out_opened = 0;
-        goto main_loop;
-    }
-
-    /* ── DS4 / HORIPAD / XIM4 / DS4-protocol third-parties / Logitech ──
-     * Identical open flow for all of them: detach driver, try IN 0x84 then
-     * fall back to 0x81. Logitech and HORI/XIM both land on 0x81 with no
-     * OUT endpoint. Dispatch in main_loop picks the right parser. */
-    if (ds4_is_compatible_vidpid(vid, pid) || vid == VID_LOGITECH) {
+    /* ── DS4 / HORIPAD / XIM4: single-pass, no handshake ──────────────── */
+    if (vid == VID_SONY || vid == VID_HORI) {
         fd = open(dev_path, O_RDWR);
         if (fd < 0) { gp_log("slot[%d] DS4 open fail errno=%d\n", slot, errno); goto exit_slot; }
 
@@ -547,10 +1030,8 @@ static void *usb_hid_thread(void *arg) {
             goto uninit_exit;
         }
         gp_log("slot[%d] DS4 IN maxpkt=%u\n", slot, (unsigned)fs_open.max_packet_length);
-        in_mpkt = fs_open.max_packet_length ? fs_open.max_packet_length : 64;
 
-        n_frames = 1;
-        buffers[0]=buf; lengths[0]=in_mpkt;
+        buffers[0]=buf; lengths[0]=64;
         eps[0].ppBuffer=buffers; eps[0].pLength=lengths; eps[0].nFrames=1;
         eps[0].timeout=50; eps[0].flags=USB_FS_FLAG_SINGLE_SHORT_OK|USB_FS_FLAG_MULTI_SHORT_OK;
 
@@ -566,13 +1047,54 @@ static void *usb_hid_thread(void *arg) {
             out_opened = (ioctl(fd,USB_FS_OPEN,&fs_open)==0) ? 1 : 0;
         }
         gp_log("slot[%d] DS4 OUT opened=%d\n", slot, out_opened);
+        goto main_loop;
+    }
 
-        /* Generic HID gamepads (Logitech etc.) may need a HID class wake-up
-         * before they start streaming reports. DS4 / HORI / XIM4 don't —
-         * they stream on enumeration. */
-        if (vid == VID_LOGITECH) {
-            logitech_wake_up(fd);
+    /* ── Manba V2 PC/XInput mode: single-pass ─────────────────────────── */
+    if (mamba_is_xinput_vidpid(vid, pid)) {
+        fd = open(dev_path, O_RDWR);
+        if (fd < 0) { gp_log("slot[%d] Mamba open fail errno=%d\n", slot, errno); goto exit_slot; }
+
+        { int ii; for(ii=0;ii<4;ii++){int i2=ii; ioctl(fd,USB_IFACE_DRIVER_DETACH,&i2);} }
+        usleep(120000);
+
+        memset(eps,0,sizeof(eps)); memset(&init,0,sizeof(init));
+        init.pEndpoints=eps; init.ep_index_max=2;
+        if (ioctl(fd,USB_FS_INIT,&init)!=0){
+            gp_log("slot[%d] Mamba FS_INIT fail errno=%d\n",slot,errno);
+            close(fd); goto exit_slot;
         }
+
+        memset(&fs_open,0,sizeof(fs_open));
+        fs_open.ep_index=0; fs_open.ep_no=MAMBA_XINPUT_EP_IN;
+        fs_open.max_bufsize=64; fs_open.max_frames=1;
+        if (ioctl(fd,USB_FS_OPEN,&fs_open)!=0){
+            gp_log("slot[%d] Mamba IN fail errno=%d\n",slot,errno);
+            goto uninit_exit;
+        }
+        gp_log("slot[%d] Mamba IN ep=0x%02x ok maxpkt=%u\n",
+               slot, MAMBA_XINPUT_EP_IN, (unsigned)fs_open.max_packet_length);
+
+        buffers[0]=buf; lengths[0]=64;
+        eps[0].ppBuffer=buffers; eps[0].pLength=lengths; eps[0].nFrames=1;
+        eps[0].timeout=50; eps[0].flags=USB_FS_FLAG_SINGLE_SHORT_OK|USB_FS_FLAG_MULTI_SHORT_OK;
+
+        memset(&fs_open,0,sizeof(fs_open));
+        fs_open.ep_index=1; fs_open.ep_no=MAMBA_XINPUT_EP_OUT;
+        fs_open.max_bufsize=64; fs_open.max_frames=1;
+        out_opened = (ioctl(fd,USB_FS_OPEN,&fs_open)==0) ? 1 : 0;
+        if (!out_opened) {
+            memset(&fs_open,0,sizeof(fs_open));
+            fs_open.ep_index=1; fs_open.ep_no=MAMBA_XINPUT_EP_OUT_ALT;
+            fs_open.max_bufsize=64; fs_open.max_frames=1;
+            out_opened = (ioctl(fd,USB_FS_OPEN,&fs_open)==0) ? 1 : 0;
+            if (out_opened) gp_log("slot[%d] Mamba OUT ep=0x%02x\n",
+                                   slot, MAMBA_XINPUT_EP_OUT_ALT);
+        } else {
+            gp_log("slot[%d] Mamba OUT ep=0x%02x\n", slot, MAMBA_XINPUT_EP_OUT);
+        }
+        gp_log("slot[%d] Mamba OUT opened=%d\n", slot, out_opened);
+        if (out_opened) mamba_xinput_send_enable(fd, eps);
         goto main_loop;
     }
 
@@ -617,7 +1139,6 @@ static void *usb_hid_thread(void *arg) {
     /* ── Nintendo: two-pass ────────────────────────────────────────────── */
     fd = open(dev_path, O_RDWR);
     if (fd < 0) { gp_log("slot[%d] open fail errno=%d\n", slot, errno); goto exit_slot; }
-
     memset(eps,0,sizeof(eps)); memset(&init,0,sizeof(init));
     init.pEndpoints=eps; init.ep_index_max=1;
     if (ioctl(fd,USB_FS_INIT,&init)!=0){
@@ -683,132 +1204,116 @@ static void *usb_hid_thread(void *arg) {
     }
 
 main_loop: ;
-    /* DS3 first: Sony and HORI VIDs match both DS3 and DS4 lists.
-     * Without this ordering DS3 packets would be parsed by the DS4 layout
-     * and produce garbage. */
-    int is_ds3      = ds3_is_compatible_vidpid(vid, pid);
-    int is_ds4      = !is_ds3 && ds4_is_compatible_vidpid(vid, pid);
-    int is_logitech = (vid == VID_LOGITECH);
-    int is_xbox     = (pid == PID_XBOX);
-    int hs_state    = (is_xbox || is_ds3 || is_ds4 || is_logitech) ? HS_STREAMING : HS_WAIT_81_01;
+    int is_ds4 = (vid == VID_SONY || vid == VID_HORI);
+    int is_mamba_xinput = mamba_is_xinput_vidpid(vid, pid);
+    int is_mamba_switch = mamba_is_switch_vidpid(vid, pid);
+    int hs_state = (pid==PID_XBOX || is_ds4 || is_mamba_xinput) ? HS_STREAMING : HS_WAIT_81_01;
     uint8_t nintendo_seq = 1;
     g_slots[slot].usb_fd = fd;  /* register fd for clean teardown on SIGTERM */
 
-    /* Cached pad state for sparse-report controllers (Logitech).
-     * PS5 seems to need continuous state updates to "lock in" a button
-     * state — a single inject_pad call gets dismissed. We re-inject the
-     * cached state on no-data poll() timeouts to keep PS5 actively seeing
-     * the input. CACHE_DECAY_ITERS short enough that fast successive
-     * presses aren't blocked by stale "pressed" state. */
-    ScePadData cached_pad; memset(&cached_pad, 0, sizeof(cached_pad));
-    cached_pad.quat.w = 1.0f;
-    cached_pad.leftStick.x  = 128; cached_pad.leftStick.y  = 128;
-    cached_pad.rightStick.x = 128; cached_pad.rightStick.y = 128;
-    int cache_valid = 0;
-    int no_data_count = 0;
-#define CACHE_DECAY_ITERS  2  /* ~100ms at 50ms cycle → 10Hz button rate ok */
-
     while (1) {
-        memset(buf,0,64);
-        for (int fi = 0; fi < n_frames; fi++) {
-            buffers[fi] = buf + fi * in_mpkt;
-            lengths[fi] = in_mpkt;
+        if (g_slots[slot].release_requested) {
+            gp_log("slot[%d] release requested - pausing VDA only\n", slot);
+            release_mamba_vda_only(slot, "official same user reclaim");
         }
-        eps[0].ppBuffer=buffers; eps[0].pLength=lengths; eps[0].nFrames=n_frames;
+
+        memset(buf,0,64);
+        buffers[0]=buf; lengths[0]=64;
+        eps[0].ppBuffer=buffers; eps[0].pLength=lengths;
         eps[0].aFrames=0; eps[0].status=0;
 
-        /* Canonical FreeBSD ugen read pattern (see lib/libusb/libusb20_ugen20.c
-         * ugen20_tr_submit + libusb20_dev_wait_process + ugen20_process):
-         *   1. USB_FS_START
-         *   2. poll(fd, ...) — wait for completion event
-         *   3. USB_FS_COMPLETE — pick up the result
-         * No USB_FS_STOP needed between successful transfers; STOP is only
-         * for cancellation. Our old busy-poll + STOP approach was dropping
-         * sparse events because of gaps between cycles. */
         memset(&start,0,sizeof(start)); start.ep_index=0;
         if (ioctl(fd,USB_FS_START,&start)!=0) {
-            int e = errno;
-            if (e == EBUSY) {
-                /* Transfer still pending from prior iter — go straight to
-                 * poll+complete and pick it up. */
-            } else if (e == ENXIO || e == ENOTTY) {
-                gp_log("slot[%d] START errno=%d — device gone\n", slot, e);
-                goto reinit;
+            if (errno==EBUSY){
+                memset(&stop,0,sizeof(stop)); stop.ep_index=0; ioctl(fd,USB_FS_STOP,&stop);
+                usleep(5000);
+            } else if (errno==ENXIO||errno==ENOTTY){
+                gp_log("slot[%d] START errno=%d — device gone\n",slot,errno); goto reinit;
             } else {
-                gp_log("slot[%d] START fatal errno=%d\n", slot, e);
-                goto reinit;
+                gp_log("slot[%d] START fatal errno=%d\n",slot,errno); goto reinit;
             }
-        }
-
-        {
-            struct pollfd pfd;
-            pfd.fd = fd;
-            pfd.events = POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM;
-            pfd.revents = 0;
-            int pr = poll(&pfd, 1, (int)eps[0].timeout);
-            if (pr <= 0) {
-                /* No event in the timeout window. Re-inject cached state
-                 * for Logitech to keep PS5 actively seeing the input
-                 * (single-shot injects get dismissed by PS5).
-                 *
-                 * Decay strategy: clear only BUTTONS (so missed release
-                 * events auto-recover) but HOLD the cached stick positions
-                 * (otherwise sticks snap to center mid-motion = stuttering).
-                 * Stick positions are corrected as soon as the next real
-                 * report arrives, which is always-immediately because each
-                 * physical stick movement generates a report. */
-                if (is_logitech) {
-                    if (cache_valid && ++no_data_count >= CACHE_DECAY_ITERS) {
-                        cached_pad.buttons         = 0;
-                        cached_pad.analogButtons.l2 = 0;
-                        cached_pad.analogButtons.r2 = 0;
-                    }
-                    if (cache_valid) inject_pad(slot, &cached_pad);
-                }
-                continue;
-            }
-        }
-
-        memset(&complete,0,sizeof(complete)); complete.ep_index=0;
-        if (ioctl(fd,USB_FS_COMPLETE,&complete) != 0) {
-            int e = errno;
-            if (e == ENXIO || e == ENOTTY) {
-                gp_log("slot[%d] COMPLETE errno=%d — gone\n", slot, e);
-                goto reinit;
-            }
-            /* EBUSY here means "nothing actually ready right now" — loop
-             * back to poll and wait again. */
             continue;
         }
 
-        if (eps[0].aFrames == 0 || lengths[0] < 1) continue;
+        int ok=0, cerr=0, cw=0;
+        for(cw=0;cw<60;cw++){
+            memset(&complete,0,sizeof(complete)); complete.ep_index=0;
+            if(ioctl(fd,USB_FS_COMPLETE,&complete)==0){ok=1;break;}
+            cerr=errno;
+            if(cerr==ENXIO||cerr==ENOTTY){gp_log("slot[%d] COMPLETE errno=%d — gone\n",slot,cerr);goto reinit;}
+            if(cerr!=EBUSY) break;
+            usleep(500);
+        }
+        if(!ok){
+            memset(&stop,0,sizeof(stop)); stop.ep_index=0; ioctl(fd,USB_FS_STOP,&stop);
+            continue;
+        }
+        if(lengths[0]<1) continue;
 
-        /* Use the first frame slot — kernel writes the newest received
-         * report there. Other slots (1..nFrames-1) may stay zeroed for
-         * the iteration if fewer reports arrived than slots queued, and
-         * reading those would give all-zero "stick at min + dpad north"
-         * stuck-input garbage. */
-        const uint8_t *parse_buf = (const uint8_t *)buffers[0];
         uint32_t len = lengths[0];
 
         ScePadData pad; memset(&pad,0,sizeof(pad)); pad.quat.w=1.0f;
         int injected = 0;
 
-        if (is_ds3) {
-            injected = ds3_handle_packet(fd, eps, parse_buf, len, &pad);
-        } else if (is_ds4) {
-            injected = ds4_handle_packet(fd, eps, parse_buf, len, &pad);
-        } else if (is_logitech) {
-            injected = logitech_handle_packet(fd, eps, parse_buf, len, &pad);
-        } else if (is_xbox) {
-            injected = xbox_handle_packet(fd, eps, parse_buf, len, &pad);
+        if (is_ds4) {
+            injected = ds4_handle_packet(fd, eps, buf, len, &pad);
+        } else if (is_mamba_xinput) {
+            injected = mamba_xinput_handle_packet(fd, eps, buf, len, &pad);
+        } else if (pid == PID_XBOX) {
+            injected = xbox_handle_packet(fd, eps, buf, len, &pad);
         } else {
-            injected = nintendo_handle_packet(fd, eps, parse_buf, len, &hs_state, &nintendo_seq, &pad);
+            if (is_mamba_switch) mamba_log_switch_packet(buf, len);
+            injected = nintendo_handle_packet(fd, eps, buf, len, &hs_state, &nintendo_seq, &pad);
+            if (injected > 0 && is_mamba_switch)
+                pad.leftStick.y = (uint8_t)(255u - pad.leftStick.y);
+        }
+
+        if (g_slots[slot].released_pause) {
+            if (injected > 0) {
+                if (g_slots[slot].release_wait_neutral) {
+                    if (pad.buttons == 0) {
+                        g_slots[slot].release_wait_neutral = 0;
+                        gp_log("slot[%d] release pause neutral seen - waiting for new Manba button\n", slot);
+                        notify("Ghost-Control: Manba released - press a button to reassign");
+                    }
+                    continue;
+                }
+
+                if (pad.buttons != 0) {
+                    if (g_assign_slot >= 0 && g_assign_slot != slot) {
+                        gp_log("slot[%d] release pause reassign blocked by assign_slot=%d\n",
+                               slot, g_assign_slot);
+                        continue;
+                    }
+
+                    gp_log("slot[%d] release pause button press - recreating VDA\n", slot);
+                    g_assign_slot = slot;
+                    int32_t new_handle = create_vda_for_slot(slot);
+                    if (new_handle < 0) {
+                        gp_log("slot[%d] release pause VDA recreate failed\n", slot);
+                        g_assign_slot = -1;
+                        continue;
+                    }
+
+                    pthread_mutex_lock(&g_slot_lock);
+                    g_slots[slot].handle = new_handle;
+                    g_slots[slot].vdi_ready = 1;
+                    g_slots[slot].released_pause = 0;
+                    g_slots[slot].release_wait_neutral = 0;
+                    g_slots[slot].confirmed = 0;
+                    g_slots[slot].inject_count = 0;
+                    pthread_mutex_unlock(&g_slot_lock);
+                    notify("Ghost-Control by StonedModder: slot[%d] ready - press a button to assign", slot);
+                    gp_log("slot[%d] release pause VDA recreated handle=0x%x\n",
+                           slot, (uint32_t)new_handle);
+                }
+            }
+            continue;
         }
 
         if (injected > 0) {
             if (!usb_ready_notified) {
-                notify("Ghostcontrol: slot[%d] streaming — controller active", slot);
+                notify("Ghost-Control by StonedModder: slot[%d] streaming - controller active", slot);
                 usb_ready_notified = 1;
             }
             /* First real button press confirms the assignment — release the gate
@@ -818,28 +1323,15 @@ main_loop: ;
                 if (g_assign_slot == slot) g_assign_slot = -1;
                 gp_log("slot[%d] assignment confirmed (button press)\n", slot);
             }
-            /* Update the cache for sparse-report controllers and reset
-             * the decay counter — we just got fresh data. */
-            if (is_logitech) {
-                memcpy(&cached_pad, &pad, sizeof(cached_pad));
-                cache_valid = 1;
-                no_data_count = 0;
-            }
             inject_pad(slot, &pad);
-        }
-
-        /* Explicit stop after each successful read for Logitech — keeps
-         * the kernel in a clean state for the next USB_FS_START. Without
-         * this, the next start returns EBUSY and we lose ~5ms to a stop+
-         * sleep recovery, dropping reports (notably button releases). */
-        if (is_logitech) {
-            memset(&stop,0,sizeof(stop)); stop.ep_index=0; ioctl(fd,USB_FS_STOP,&stop);
+            if ((g_slots[slot].inject_count % 600) == 0)
+                maybe_disconnect_physical_pad_for_slot(slot);
         }
     }
 
 reinit:
     g_slots[slot].usb_fd = -1;  /* unregister before teardown */
-    if (usb_ready_notified) { notify("Ghostcontrol: slot[%d] controller disconnected", slot); usb_ready_notified=0; }
+    if (usb_ready_notified) { notify("Ghost-Control by StonedModder: slot[%d] controller disconnected", slot); usb_ready_notified=0; }
     memset(&stop,0,sizeof(stop)); stop.ep_index=0; ioctl(fd,USB_FS_STOP,&stop);
     if (out_opened) {
         memset(&fs_close,0,sizeof(fs_close)); fs_close.ep_index=1; ioctl(fd,USB_FS_CLOSE,&fs_close);
@@ -852,14 +1344,30 @@ uninit_exit:
 
 exit_slot:
     gp_log("slot[%d] USB thread exiting — freeing slot\n", slot);
+    uint64_t evicted_phys = g_slots[slot].evicted_physical_dev;
+    uint64_t vdev = g_slots[slot].virtual_dev_id;
+    if (vdev) {
+        int vdr = shellui_pad_disconnect_device(vdev);
+        gp_log("slot[%d] disconnect virtual dev=0x%llx ret=%d\n",
+               slot, (unsigned long long)vdev, vdr);
+    }
     scePadVirtualDeviceDeleteDevice(g_slots[slot].handle);
     pthread_mutex_lock(&g_slot_lock);
     g_slots[slot].handle    = -1;
     g_slots[slot].vdi_ready = 0;
     g_slots[slot].usb_active= 0;
+    g_slots[slot].release_requested = 0;
+    g_slots[slot].released_pause = 0;
+    g_slots[slot].release_wait_neutral = 0;
     g_slots[slot].usb_fd    = -1;
+    g_slots[slot].virtual_dev_id = 0;
+    g_slots[slot].evicted_physical_dev = 0;
+    g_slots[slot].physical_evict_done = 0;
     g_slots[slot].dev_path[0] = '\0';
     pthread_mutex_unlock(&g_slot_lock);
+    if (evicted_phys)
+        remember_physical_pad_for_recovery(evicted_phys,
+                                           "Manba slot exited");
     return NULL;
 }
 
@@ -913,6 +1421,12 @@ static void *controller_manager_thread(void *arg) {
             uint16_t vid=0, pid=0;
             if (!probe_one_path(path, &vid, &pid)) continue;
 
+            if (mamba_is_supported_vidpid(vid, pid) && any_mamba_slot_active()) {
+                if ((scan % 5) == 0)
+                    gp_log("manager: %s ignored because another Manba slot is active\n", path);
+                continue;
+            }
+
             /* Find free slot */
             int slot = -1;
             pthread_mutex_lock(&g_slot_lock);
@@ -927,28 +1441,25 @@ static void *controller_manager_thread(void *arg) {
             }
 
             const char *name =
-                (vid==VID_SWITCH && pid==PID_SWITCH)        ? "Nintendo Switch Pro / 8BitDo" :
-                (vid==VID_NATIVE && pid==PID_NATIVE)        ? "8BitDo Native" :
-                (vid==VID_XBOX   && pid==PID_XBOX)          ? "Xbox One/Series" :
-                (vid==VID_SONY   && pid==PID_DS3)           ? "DualShock 3 / SIXAXIS" :
-                ds3_is_compatible_vidpid(vid, pid)          ? "PS3-protocol third-party" :
-                (vid==VID_SONY)                              ? "DualShock 4" :
-                (vid==VID_HORI)                              ? "HORIPAD / DS4-compatible (XIM4)" :
-                (vid==VID_LOGITECH)                          ? "Logitech RumblePad / DInput pad" :
-                ds4_is_compatible_vidpid(vid, pid)           ? "DS4-protocol third-party" :
-                                                               "Unknown";
+                mamba_is_supported_vidpid(vid,pid) ? mamba_name(vid,pid) :
+                                                     "Unknown";
 
             gp_log("manager: %s at %s → slot[%d]\n", name, path, slot);
-            notify("Ghostcontrol: %s detected — assign user on screen", name);
+            notify("Ghost-Control by StonedModder: %s detected - assign user on screen", name);
 
             /* Claim the slot path before VDA so manager skips it if we retry.
              * Set the assignment gate — released when user confirms (button press). */
             pthread_mutex_lock(&g_slot_lock);
             strncpy(g_slots[slot].dev_path, path, sizeof(g_slots[slot].dev_path)-1);
             g_slots[slot].usb_active = 1; /* tentatively claimed */
+            g_slots[slot].release_requested = 0;
+            g_slots[slot].released_pause = 0;
+            g_slots[slot].release_wait_neutral = 0;
             g_slots[slot].confirmed  = 0;
             g_slots[slot].vid = vid;
             g_slots[slot].pid = pid;
+            g_slots[slot].evicted_physical_dev = 0;
+            g_slots[slot].physical_evict_done = 0;
             pthread_mutex_unlock(&g_slot_lock);
             g_assign_slot = slot;
 
@@ -958,8 +1469,14 @@ static void *controller_manager_thread(void *arg) {
                 gp_log("manager: slot[%d] VDA failed — releasing\n", slot);
                 pthread_mutex_lock(&g_slot_lock);
                 g_slots[slot].usb_active = 0;
+                g_slots[slot].release_requested = 0;
+                g_slots[slot].released_pause = 0;
+                g_slots[slot].release_wait_neutral = 0;
                 g_slots[slot].dev_path[0] = '\0';
                 g_slots[slot].handle = -1;
+                g_slots[slot].virtual_dev_id = 0;
+                g_slots[slot].evicted_physical_dev = 0;
+                g_slots[slot].physical_evict_done = 0;
                 pthread_mutex_unlock(&g_slot_lock);
                 g_assign_slot = -1;
                 continue;
@@ -978,7 +1495,10 @@ static void *controller_manager_thread(void *arg) {
                 scePadVirtualDeviceDeleteDevice(handle);
                 pthread_mutex_lock(&g_slot_lock);
                 g_slots[slot].handle=-1; g_slots[slot].vdi_ready=0;
-                g_slots[slot].usb_active=0; g_slots[slot].dev_path[0]='\0';
+                g_slots[slot].usb_active=0; g_slots[slot].release_requested=0; g_slots[slot].released_pause=0; g_slots[slot].release_wait_neutral=0; g_slots[slot].dev_path[0]='\0';
+                g_slots[slot].virtual_dev_id=0;
+                g_slots[slot].evicted_physical_dev=0;
+                g_slots[slot].physical_evict_done=0;
                 pthread_mutex_unlock(&g_slot_lock);
                 g_assign_slot = -1;
                 continue;
@@ -994,14 +1514,17 @@ static void *controller_manager_thread(void *arg) {
                 scePadVirtualDeviceDeleteDevice(handle);
                 pthread_mutex_lock(&g_slot_lock);
                 g_slots[slot].handle=-1; g_slots[slot].vdi_ready=0;
-                g_slots[slot].usb_active=0; g_slots[slot].dev_path[0]='\0';
+                g_slots[slot].usb_active=0; g_slots[slot].release_requested=0; g_slots[slot].released_pause=0; g_slots[slot].release_wait_neutral=0; g_slots[slot].dev_path[0]='\0';
+                g_slots[slot].virtual_dev_id=0;
+                g_slots[slot].evicted_physical_dev=0;
+                g_slots[slot].physical_evict_done=0;
                 pthread_mutex_unlock(&g_slot_lock);
                 g_assign_slot = -1;
             } else {
                 pthread_detach(tid);
                 gp_log("manager: slot[%d] USB thread started handle=0x%x\n",
                        slot, (uint32_t)handle);
-                notify("Ghostcontrol: slot[%d] ready — press a button to assign", slot);
+                notify("Ghost-Control by StonedModder: slot[%d] ready - press a button to assign", slot);
             }
             /* One controller per scan pass — assignment gate blocks the rest
              * until the user confirms this one with a button press. */
@@ -1020,6 +1543,8 @@ static void *controller_manager_thread(void *arg) {
         } else {
             assign_wait = 0;
         }
+
+        physical_recovery_tick(scan);
 
         scan++;
         if ((scan % 5) == 0) {
@@ -1075,8 +1600,8 @@ int main(void) {
     int32_t userId=-1, fgUser=-1; int ret;
 
     ghostpad_status_log_reset();
-    gp_log("Ghost-Control v5 starting — %d slots\n", MAX_SLOTS);
-    notify("Ghostcontrol by StonedModder — plug in controllers now");
+    gp_log("Ghost-Control by StonedModder - Patch Manba V2 NBJr starting - %d slots\n", MAX_SLOTS);
+    notify("Ghost-Control by StonedModder - Patch Manba V2 NBJr");
 
     /* Kill previous instance */
     { int pfd=open(PID_PATH,O_RDONLY);
@@ -1093,8 +1618,14 @@ int main(void) {
         g_slots[s].handle     = -1;
         g_slots[s].vdi_ready  = 0;
         g_slots[s].usb_active = 0;
+        g_slots[s].release_requested = 0;
+        g_slots[s].released_pause = 0;
+        g_slots[s].release_wait_neutral = 0;
         g_slots[s].confirmed  = 0;
         g_slots[s].usb_fd     = -1;
+        g_slots[s].virtual_dev_id = 0;
+        g_slots[s].evicted_physical_dev = 0;
+        g_slots[s].physical_evict_done = 0;
         g_slots[s].dev_path[0]= '\0';
     }
     g_assign_slot = -1;
