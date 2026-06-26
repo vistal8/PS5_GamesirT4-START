@@ -1,100 +1,34 @@
-# Ghostcontrol — by StonedModder
-
-If you enjoy my work - please consider donating to my BTC address: 
-
-`bc1qa9zfgnccajsw8vg7k287qz5a7apf8pefj5jjx5`
-
-
-Use third-party USB controllers on PS5. Reads USB HID input from a plugged-in controller and injects it into a virtual DualSense via the PS5's `scePadVirtualDeviceInsertData` path (Ghostpad VDI path).
-
-**Tested controller:** 8BitDo Ultimate 2 in Nintendo Switch Pro Controller mode (VID=0x057e PID=0x2009)
-
----
-
-
-
-https://github.com/user-attachments/assets/6583b1c2-3d3d-4f2e-9e79-689121fea4a3
-
-
-
-## Features
-
-- 60Hz input streaming from USB HID controller → virtual DualSense
-- PS5 notifications: startup, controller connect/disconnect, detected controller type
-- User assignment: virtual DualSense is bound to the foreground user on startup
-- Full button mapping: face buttons, triggers, sticks, dpad, L3/R3, PS button
-- Auto-reconnect on controller unplug/replug
-
----
-
-## Requirements
-
-- PS5 with kernel exploit (tested on jailbroken PS5)
-- [ps5-payload-sdk](https://github.com/ps5-payload-dev/sdk)
-- USB controller — see supported list below
-
----
-
-## Supported Controllers
-
-| Controller | Mode | VID:PID | Status |
-|-----------|------|---------|--------|
-| 8BitDo Ultimate 2 | Nintendo Switch Pro | 057e:2009 | ✅ Working |
-| 8BitDo Ultimate 2 | Native | 2dc8:310b | Untested |
-
-See `othercontrollersGuide.md` for adding new controllers.
-
----
-
-## Build
-
-```sh
-export PS5_PAYLOAD_SDK=/path/to/ps5-payload-sdk
-make clean all
-```
-
-Output: `ghost-control-ps5.elf`
-
-## Deploy
-
-```sh
-# Deploy to PS5 (replace IP)
-nc -w 5 192.168.1.xxx 9021 < ghost-control-ps5.elf
-```
-
-Or set `PS5_HOST` in your environment:
-```sh
-make deploy PS5_HOST=192.168.1.xxx
-```
-
----
-
-## How It Works
-
-1. **VDA**: Creates a virtual DualSense via `scePadVirtualDeviceAddDevice(type=3)`
-2. **klog capture**: Monitors klogsrv TCP to detect the `DEVICE_ADDED` event and get the device handle
-3. **force_bind**: Binds the virtual device to the foreground user via ShellUI MBus IPC
-4. **USB HID thread**: Detaches `usb_hid0` from the controller, opens raw USB FS endpoints, runs the Nintendo Switch Pro Controller USB handshake, then reads 60Hz input reports
-5. **VDI inject**: Parses HID reports into `ScePadData` and calls `scePadVirtualDeviceInsertData` at 60Hz
-
-See `ProControllerResearch.md` for the full research documentation on the USB HID protocol.
-
----
-
-## Files
-
-| File | Description |
-|------|-------------|
-| `gc_main.c` | Main payload — VDA, VDI, USB HID thread, button parsing |
-| `shellui_pad.c` | ShellUI PT_ATTACH helper for force_bind via MBus |
-| `shellui_pad.h` | Header for shellui_pad |
-| `Makefile` | Build system |
-| `ghost-control-ps5.elf` | Pre-compiled payload (deploy directly) |
-| `ProControllerResearch.md` | Full USB protocol research for Nintendo Switch Pro Controller |
-| `othercontrollersGuide.md` | Guide for adding other USB HID controllers |
-
----
-
-## License
-
-GPL-3.0-or-later
+中文版本 (Chinese)
+🚀 项目名称：GhostControl - GameSir T4 修正版
+基于 StonedModder/Ghostcontrol-PS5-USB-Controller-Patcher 修改
+核心改进： 解决了原版驱动中摇杆轴向颠倒的痛点，完美适配 GameSir T4 (Start云手柄)。
+✨ 功能亮点
+摇杆修复：修正了原版驱动中摇杆方向颠倒的问题，操作手感丝滑顺畅。
+全向控制：左摇杆、右摇杆及方向键（D-Pad）均已调试正常，满足各类游戏需求。
+即插即用：基于 PS5 Payload 技术，通过 USB 连接即可让非官方手柄被 PS5 识别为虚拟 DualSense 手柄。
+📌 使用须知
+硬件要求：已获取内核权限（已越狱/已刷机）的 PS5 主机。
+手柄模式：请确保 GameSir T4 处于正确的连接模式（通常为 Switch 模式或特定映射模式）。
+免责声明：使用第三方驱动存在风险，请谨慎操作。
+🙏 致谢
+特别感谢 StonedModder 大神提供的底层核心代码。
+感谢 OpenAI 提供的 AI 技术支持。
+English Version
+🚀 Project: GhostControl - GameSir T4 Patched Edition
+Forked & Modified from StonedModder/Ghostcontrol-PS5-USB-Controller-Patcher
+Key Fix: Resolved the inverted joystick axis issue present in the original version, providing perfect compatibility for the GameSir T4 (Start Cloud Controller).
+✨ Features
+Joystick Correction: Fixed the reversed analog stick directions, ensuring smooth and intuitive control.
+Full Input Support: Both thumbsticks and the D-pad are fully functional and properly mapped.
+Plug & Play: Utilizes PS5 Payload technology to inject USB controller input as a virtual DualSense device.
+📌 Requirements
+Hardware: A PS5 console with kernel exploit access (Jailbroken).
+Controller Mode: Ensure your GameSir T4 is in the correct mode (e.g., Switch Pro mode).
+Note: Use at your own risk.
+🙏 Acknowledgements
+Huge thanks to StonedModder for the original open-source project.
+Thanks to OpenAI for AI support.
+💡 技术背景补充 (供参考)
+为了让你的介绍更具专业性，这里补充一些底层逻辑说明（基于参考文档）：
+工作原理：该项目利用了 PS5 的 scePadVirtualDevice 接口。它通过 USB 读取第三方手柄（如 GameSir T4）的原始数据，经过方向修正后，将其“伪装”成一个官方的虚拟 DualSense 手柄发送给系统。
+为何需要修正：很多第三方手柄在 HID 通信协议上与 Switch 或 XInput 标准存在细微差异（例如 X/Y 轴的正负极性定义相反），导致原版驱动直接读取时会出现“往上推摇杆角色往下走”的情况。你的修改主要是在 gc_main.c 或数据解析层对轴向数据进行了取反（value = -value）处理。
